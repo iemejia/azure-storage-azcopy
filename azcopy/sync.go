@@ -68,7 +68,8 @@ type SyncOptions struct {
 	Symlinks                common.SymlinkHandlingType
 	PreservePermissions     bool
 	Hardlinks               common.HardlinkHandlingType
-	DedupCopy               bool // Enable content-based dedup: use server-side copy within destination when identical content exists
+	DedupCopy            bool     // Enable content-based dedup: use server-side copy within destination when identical content exists
+	DedupIndexContainers []string // Additional destination containers to include in the dedup hash index for cross-container dedup
 
 	dryrun                           bool
 	deleteDestinationFileIfNecessary bool

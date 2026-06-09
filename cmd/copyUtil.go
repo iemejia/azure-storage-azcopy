@@ -91,3 +91,19 @@ func ConstructCommandStringFromArgs() string {
 	}
 	return s.String()
 }
+
+// parseDedupIndexContainers parses a comma-separated list of container names.
+func parseDedupIndexContainers(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}

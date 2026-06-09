@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"runtime"
 	"strings"
 
@@ -220,6 +221,27 @@ func (s *syncer) initEnumerator(ctx context.Context, logLevel common.LogLevel, m
 		destLocation := s.opts.fromTo.To()
 		dedupFromTo := common.FromToValue(destLocation, destLocation)
 
+		// Determine whether we're in cross-container mode.
+		crossContainer := len(s.opts.dedupIndexContainers) > 0
+
+		// Determine source and destination roots for the dedup job.
+		// In cross-container mode, the source root is the service-level URL (account URL without container),
+		// so that the source blob can reference any container. The destination root is also set to service-level
+		// so that the destination path includes the container name.
+		// In same-container mode (current default), both remain at the container level.
+		var dedupSourceRoot, dedupDestRoot common.ResourceString
+		if crossContainer {
+			serviceURL, err := getServiceLevelURL(s.opts.destination)
+			if err != nil {
+				return nil, fmt.Errorf("failed to derive service-level URL for cross-container dedup: %w", err)
+			}
+			dedupSourceRoot = serviceURL
+			dedupDestRoot = serviceURL
+		} else {
+			dedupSourceRoot = s.opts.destination.CloneWithConsolidatedSeparators()
+			dedupDestRoot = s.opts.destination.CloneWithConsolidatedSeparators()
+		}
+
 		// Create a job template for intra-destination server-side copies.
 		dedupJobTemplate := &common.CopyJobPartOrderRequest{
 			JobID:               common.NewJobID(), // separate job for dedup copies
@@ -227,8 +249,8 @@ func (s *syncer) initEnumerator(ctx context.Context, logLevel common.LogLevel, m
 			FromTo:              dedupFromTo,
 			Fpo:                 fpo,
 			SymlinkHandlingType: s.opts.symlinks,
-			SourceRoot:          s.opts.destination.CloneWithConsolidatedSeparators(), // source is the destination (copy within)
-			DestinationRoot:     s.opts.destination.CloneWithConsolidatedSeparators(),
+			SourceRoot:          dedupSourceRoot,
+			DestinationRoot:     dedupDestRoot,
 
 			BlobAttributes: common.BlobTransferAttributes{
 				PreserveLastModifiedTime:         s.opts.preserveInfo,
@@ -264,10 +286,23 @@ func (s *syncer) initEnumerator(ctx context.Context, logLevel common.LogLevel, m
 		reportFirstPart := func(jobStarted bool) {} // no-op for dedup job
 		reportFinalPart := func() {}                // no-op for dedup job
 		dedupScheduler := NewCopyTransferProcessor(false, dedupJobTemplate, NumOfFilesPerDispatchJobPart,
-			s.opts.destination, s.opts.destination,
+			dedupSourceRoot, dedupDestRoot,
 			reportFirstPart, reportFinalPart, s.opts.s2SPreserveAccessTier, s.opts.dryrun, s.opts.dryrunJobPartOrderHandler)
 
-		dedupProc = newSyncDedupProcessor(hashIndexer, dedupScheduler, transferScheduler, dedupFromTo)
+		// Get the destination container name so the dedup processor can use it for path construction.
+		dstContainerName := ""
+		if crossContainer {
+			dstContainerName, _ = GetContainerName(s.opts.destination.Value, s.opts.fromTo.To())
+		}
+
+		dedupProc = newSyncDedupProcessor(hashIndexer, dedupScheduler, transferScheduler, dedupFromTo, crossContainer, dstContainerName)
+
+		// Enumerate additional containers for cross-container dedup index.
+		if crossContainer {
+			if err := s.enumerateAdditionalDedupContainers(ctx, hashIndexer); err != nil {
+				return nil, fmt.Errorf("failed to enumerate additional dedup containers: %w", err)
+			}
+		}
 	}
 
 	// indexer keeps track of the destination (source in case of upload) files and folders
@@ -405,4 +440,85 @@ func finalizeDedup(dedupProc *syncDedupProcessor, hashIndexer *traverser.HashInd
 		"Dedup stats: %d file(s) via server-side copy (dedup), %d file(s) via normal transfer.",
 		dedupProc.DedupCount(), dedupProc.NormalCount()))
 	return nil
+}
+
+// getServiceLevelURL derives the service-level (account) URL from a container-level ResourceString.
+// For example, "https://account.blob.core.windows.net/container" -> "https://account.blob.core.windows.net"
+func getServiceLevelURL(resource common.ResourceString) (common.ResourceString, error) {
+	parsed, err := url.Parse(resource.Value)
+	if err != nil {
+		return common.ResourceString{}, err
+	}
+	// Strip the path (which contains the container and any blob path)
+	parsed.Path = ""
+	parsed.RawPath = ""
+	return resource.CloneWithValue(parsed.String()), nil
+}
+
+// enumerateAdditionalDedupContainers traverses the specified additional containers on the
+// destination account and populates the hash indexer with their objects for cross-container dedup.
+func (s *syncer) enumerateAdditionalDedupContainers(ctx context.Context, hashIndexer *traverser.HashIndexer) error {
+	// Get the destination container name so we can skip it if the user included it in the list
+	dstContainerName, _ := GetContainerName(s.opts.destination.Value, s.opts.fromTo.To())
+
+	for _, containerName := range s.opts.dedupIndexContainers {
+		// Skip the destination container itself -- it's already being indexed via the normal traversal
+		if strings.EqualFold(containerName, dstContainerName) {
+			common.GetLifecycleMgr().Info(fmt.Sprintf("Skipping container '%s' from dedup-index-containers (it is the destination container, already indexed).", containerName))
+			continue
+		}
+
+		// Construct a ResourceString for this container by replacing the container in the destination URL
+		containerResource, err := buildContainerResourceString(s.opts.destination, containerName)
+		if err != nil {
+			return fmt.Errorf("failed to build URL for dedup container '%s': %w", containerName, err)
+		}
+
+		// Create a traverser for this container
+		containerTraverser, err := traverser.InitResourceTraverser(containerResource, s.opts.fromTo.To(), ctx, traverser.InitResourceTraverserOptions{
+			Client:         s.srp.dstServiceClient,
+			CredentialType: s.srp.dstCredType,
+			IncrementEnumeration: func(entityType common.EntityType, _ common.SymlinkHandlingType, _ common.HardlinkHandlingType) {
+				// No-op: we don't count dedup index enumeration in the sync progress
+			},
+			SyncHashType:            s.opts.compareHash,
+			Recursive:               true, // always recursive for dedup indexing
+			GetPropertiesInFrontend: true,
+			IncludeDirectoryStubs:   false, // we only care about files for dedup
+			FromTo:                  common.FromToValue(s.opts.fromTo.To(), s.opts.fromTo.To()), // read as destination type
+		})
+		if err != nil {
+			common.GetLifecycleMgr().Info(fmt.Sprintf("WARNING: Failed to create traverser for dedup container '%s': %v. Skipping.", containerName, err))
+			continue
+		}
+
+		// Traverse and feed into hash indexer
+		err = containerTraverser.Traverse(nil, func(obj traverser.StoredObject) error {
+			hashIndexer.Store(obj)
+			return nil
+		}, nil)
+		if err != nil {
+			common.GetLifecycleMgr().Info(fmt.Sprintf("WARNING: Error enumerating dedup container '%s': %v. Partial index may be used.", containerName, err))
+		} else {
+			common.GetLifecycleMgr().Info(fmt.Sprintf("Indexed container '%s' for dedup (%d unique hashes total).", containerName, hashIndexer.IndexedCount()))
+		}
+	}
+	return nil
+}
+
+// buildContainerResourceString creates a ResourceString pointing to a specific container
+// on the same account as the given resource (which should be at container level or below).
+func buildContainerResourceString(resource common.ResourceString, containerName string) (common.ResourceString, error) {
+	parsed, err := url.Parse(resource.Value)
+	if err != nil {
+		return common.ResourceString{}, err
+	}
+	// Replace the path with just the container name
+	parsed.Path = "/" + containerName
+	parsed.RawPath = ""
+	return common.ResourceString{
+		Value:      parsed.String(),
+		SAS:        resource.SAS,
+		ExtraQuery: resource.ExtraQuery,
+	}, nil
 }

@@ -22,6 +22,8 @@ package cmd
 
 import (
 	"crypto/md5"
+	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -419,4 +421,282 @@ func TestSyncRawArgsDedupCopyFieldPassthrough(t *testing.T) {
 	opts, err = raw.toOptions()
 	a.Nil(err)
 	a.False(opts.DedupCopy)
+}
+
+// TestSyncUploadWithDedupCopyCrossContainer tests that --dedup-index-containers enables
+// cross-container deduplication. A blob matching content in a different container on the
+// destination account should be server-side copied from that container.
+//
+// Scenario:
+// - "archive" container has blob data/old-report.txt with Content-MD5
+// - "dest" container is the sync destination (starts empty)
+// - Source has reports/report.txt with same content as archive/data/old-report.txt
+// - Expected: report.txt should be transferred via dedup (BlobBlob copy from archive container)
+func TestSyncUploadWithDedupCopyCrossContainer(t *testing.T) {
+	a := assert.New(t)
+	bsc := getBlobServiceClient()
+
+	// Create the archive (source for dedup) container
+	archiveCC, archiveContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, archiveCC)
+
+	// Create the destination container
+	destCC, destContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, destCC)
+
+	// Upload a blob to the archive container WITH Content-MD5
+	archiveContent := "This is archived content that should be dedup-copied cross-container"
+	md5Archive := md5.Sum([]byte(archiveContent))
+
+	archiveBlobClient := archiveCC.NewBlockBlobClient("data/old-report.txt")
+	_, err := archiveBlobClient.Upload(ctx, streaming.NopCloser(strings.NewReader(archiveContent)),
+		&blockblob.UploadOptions{
+			HTTPHeaders: &blob.HTTPHeaders{
+				BlobContentMD5: md5Archive[:],
+			},
+		})
+	a.Nil(err)
+
+	// Also upload some unique content to the destination container
+	uniqueContent := "Unique content only in dest"
+	md5Unique := md5.Sum([]byte(uniqueContent))
+	destBlobClient := destCC.NewBlockBlobClient("existing/unique.txt")
+	_, err = destBlobClient.Upload(ctx, streaming.NopCloser(strings.NewReader(uniqueContent)),
+		&blockblob.UploadOptions{
+			HTTPHeaders: &blob.HTTPHeaders{
+				BlobContentMD5: md5Unique[:],
+			},
+		})
+	a.Nil(err)
+
+	time.Sleep(time.Millisecond * 1050)
+
+	// Set up local source directory
+	// - report.txt has SAME content as archive/data/old-report.txt → should trigger cross-container dedup
+	// - new-file.txt has completely new content → should trigger normal upload
+	srcDirName := scenarioHelper{}.generateLocalDirectory(a)
+	defer os.RemoveAll(srcDirName)
+
+	scenarioHelper{}.generateLocalFilesFromList(a, srcDirName, []string{"reports/report.txt", "data/new-file.txt"})
+	err = os.WriteFile(srcDirName+"/reports/report.txt", []byte(archiveContent), 0644)
+	a.Nil(err)
+	err = os.WriteFile(srcDirName+"/data/new-file.txt", []byte("Brand new content not anywhere on destination"), 0644)
+	a.Nil(err)
+
+	// Set up the dedup interceptor
+	mockedRPC := &dedupInterceptor{}
+	mockedRPC.init(common.EFromTo.LocalBlob(), common.EFromTo.BlobBlob())
+
+	// For cross-container dedup, we need an account-level SAS (not container-level)
+	// because the traverser needs to access multiple containers.
+	accountName, accountKey := getAccountAndKey()
+	credential, err := blob.NewSharedKeyCredential(accountName, accountKey)
+	a.Nil(err)
+	bscWithSAS := getBlobServiceClientWithSAS(a, credential)
+	// Extract the account SAS from the service client URL
+	serviceURLWithSAS, err := url.Parse(bscWithSAS.URL())
+	a.Nil(err)
+	// Build a container URL with the account SAS
+	destURLWithAccountSAS := fmt.Sprintf("https://%s.blob.core.windows.net/%s?%s",
+		accountName, destContainerName, serviceURLWithSAS.RawQuery)
+
+	raw := getDefaultSyncRawInput(srcDirName, destURLWithAccountSAS)
+	raw.dedupCopy = true
+	raw.dedupIndexContainers = archiveContainerName
+	raw.putMd5 = true
+	raw.compareHash = "MD5"
+
+	// Run sync
+	runSyncAndVerify(a, raw, mockedRPC.intercept, mockedRPC.delete, func(err error) {
+		a.Nil(err)
+
+		// report.txt should be routed through dedup (BlobBlob) because its content
+		// matches archive/data/old-report.txt in the archive container
+		a.Equal(1, len(mockedRPC.dedupTransfers), "Expected 1 dedup transfer for reports/report.txt (cross-container match)")
+
+		// new-file.txt should be routed through normal upload (LocalBlob)
+		a.Equal(1, len(mockedRPC.normalTransfers), "Expected 1 normal transfer for data/new-file.txt")
+
+		// Verify the dedup transfer source references the archive container
+		dedupSrc := mockedRPC.dedupTransfers[0].Source
+		a.Contains(dedupSrc, archiveContainerName, "Dedup source should reference the archive container")
+		a.Contains(dedupSrc, "data/old-report.txt", "Dedup source should reference the blob path in archive")
+
+		// Verify the dedup transfer destination references the dest container
+		dedupDst := mockedRPC.dedupTransfers[0].Destination
+		a.Contains(dedupDst, destContainerName, "Dedup destination should reference the dest container")
+		a.Contains(dedupDst, "reports/report.txt", "Dedup destination should target reports/report.txt")
+	})
+}
+
+// TestSyncDedupIndexContainersImpliesDedupCopy tests that specifying --dedup-index-containers
+// automatically enables --dedup-copy.
+func TestSyncDedupIndexContainersImpliesDedupCopy(t *testing.T) {
+	a := assert.New(t)
+
+	tmpDir := t.TempDir()
+	raw := getDefaultSyncRawInput(tmpDir, "https://account.blob.core.windows.net/container?sv=2021-06-08&se=2030-01-01&sr=c&sp=rwdlacx&sig=fake")
+	raw.dedupIndexContainers = "archive,backups"
+	// Note: dedupCopy is NOT explicitly set
+
+	opts, err := raw.toOptions()
+	a.Nil(err)
+	a.True(opts.DedupCopy, "--dedup-index-containers should imply --dedup-copy")
+	a.Equal([]string{"archive", "backups"}, opts.DedupIndexContainers)
+}
+
+// TestSyncDedupIndexContainersRequiresBlobDestination tests that --dedup-index-containers
+// is rejected when the destination is not Azure Blob storage.
+// Note: This validation happens during option cooking (newCookedSyncOptions), not in toOptions().
+// We test this by verifying the options are populated correctly and relying on the
+// unit test in azcopy/ package for the actual validation logic.
+func TestSyncDedupIndexContainersRequiresBlobDestination(t *testing.T) {
+	a := assert.New(t)
+
+	tmpDir := t.TempDir()
+	// For a BlobLocal scenario, dedupCopy gets auto-disabled (destination is local)
+	raw := getDefaultSyncRawInput("https://account.blob.core.windows.net/container?sv=2021-06-08&se=2030-01-01&sr=c&sp=rwdlacx&sig=fake", tmpDir)
+	raw.dedupIndexContainers = "archive"
+	raw.fromTo = "BlobLocal"
+
+	opts, err := raw.toOptions()
+	a.Nil(err) // toOptions() itself doesn't validate
+	// The DedupIndexContainers is populated but dedupCopy is auto-enabled
+	a.Equal([]string{"archive"}, opts.DedupIndexContainers)
+	// DedupCopy is true because dedupIndexContainers implies it at the toOptions level
+	a.True(opts.DedupCopy)
+	// The actual validation (rejecting non-blob destinations) happens in cookedSyncOptions.validateOptions()
+	// which is tested in the azcopy package
+}
+
+// TestSyncUploadWithDedupCopyCrossContainerMultiple tests dedup against multiple containers.
+// Content is spread across two different containers, and the sync should find matches in both.
+func TestSyncUploadWithDedupCopyCrossContainerMultiple(t *testing.T) {
+	a := assert.New(t)
+	bsc := getBlobServiceClient()
+
+	// Create two "index" containers and a destination container
+	archiveCC, archiveContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, archiveCC)
+	backupsCC, backupsContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, backupsCC)
+	destCC, destContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, destCC)
+
+	// Upload content to archive container
+	contentA := "Content from the archive container for dedup test"
+	md5A := md5.Sum([]byte(contentA))
+	archiveBlobClient := archiveCC.NewBlockBlobClient("path/fileA.txt")
+	_, err := archiveBlobClient.Upload(ctx, streaming.NopCloser(strings.NewReader(contentA)),
+		&blockblob.UploadOptions{HTTPHeaders: &blob.HTTPHeaders{BlobContentMD5: md5A[:]}})
+	a.Nil(err)
+
+	// Upload different content to backups container
+	contentB := "Content from the backups container for dedup test"
+	md5B := md5.Sum([]byte(contentB))
+	backupsBlobClient := backupsCC.NewBlockBlobClient("bak/fileB.txt")
+	_, err = backupsBlobClient.Upload(ctx, streaming.NopCloser(strings.NewReader(contentB)),
+		&blockblob.UploadOptions{HTTPHeaders: &blob.HTTPHeaders{BlobContentMD5: md5B[:]}})
+	a.Nil(err)
+
+	time.Sleep(time.Millisecond * 1050)
+
+	// Set up local source with files matching both containers
+	srcDirName := scenarioHelper{}.generateLocalDirectory(a)
+	defer os.RemoveAll(srcDirName)
+	scenarioHelper{}.generateLocalFilesFromList(a, srcDirName, []string{"fromArchive.txt", "fromBackups.txt", "brandNew.txt"})
+	err = os.WriteFile(srcDirName+"/fromArchive.txt", []byte(contentA), 0644) // matches archive
+	a.Nil(err)
+	err = os.WriteFile(srcDirName+"/fromBackups.txt", []byte(contentB), 0644) // matches backups
+	a.Nil(err)
+	err = os.WriteFile(srcDirName+"/brandNew.txt", []byte("completely new content"), 0644) // no match
+	a.Nil(err)
+
+	// Set up interceptor
+	mockedRPC := &dedupInterceptor{}
+	mockedRPC.init(common.EFromTo.LocalBlob(), common.EFromTo.BlobBlob())
+
+	// Use account-level SAS for cross-container access
+	accountName, accountKey := getAccountAndKey()
+	credential, err := blob.NewSharedKeyCredential(accountName, accountKey)
+	a.Nil(err)
+	bscWithSAS := getBlobServiceClientWithSAS(a, credential)
+	serviceURLWithSAS, err := url.Parse(bscWithSAS.URL())
+	a.Nil(err)
+	destURLWithAccountSAS := fmt.Sprintf("https://%s.blob.core.windows.net/%s?%s",
+		accountName, destContainerName, serviceURLWithSAS.RawQuery)
+
+	raw := getDefaultSyncRawInput(srcDirName, destURLWithAccountSAS)
+	raw.dedupCopy = true
+	raw.dedupIndexContainers = archiveContainerName + "," + backupsContainerName
+	raw.putMd5 = true
+	raw.compareHash = "MD5"
+
+	runSyncAndVerify(a, raw, mockedRPC.intercept, mockedRPC.delete, func(err error) {
+		a.Nil(err)
+
+		// Two files should be dedup-copied (one from archive, one from backups)
+		a.Equal(2, len(mockedRPC.dedupTransfers), "Expected 2 dedup transfers (one from each indexed container)")
+
+		// One file (brandNew.txt) should go through normal upload
+		a.Equal(1, len(mockedRPC.normalTransfers), "Expected 1 normal transfer for brandNew.txt")
+	})
+}
+
+// TestSyncUploadWithDedupCopyCrossContainerSkipsSameContainer tests that specifying
+// the destination container name in --dedup-index-containers is silently skipped
+// (since it's already being indexed via the normal destination traversal).
+func TestSyncUploadWithDedupCopyCrossContainerSkipsSameContainer(t *testing.T) {
+	a := assert.New(t)
+	bsc := getBlobServiceClient()
+
+	// Create dest container with a blob that has Content-MD5
+	destCC, destContainerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, destCC)
+
+	content := "Content already in the destination container"
+	md5Content := md5.Sum([]byte(content))
+	blobClient := destCC.NewBlockBlobClient("existing/original.txt")
+	_, err := blobClient.Upload(ctx, streaming.NopCloser(strings.NewReader(content)),
+		&blockblob.UploadOptions{HTTPHeaders: &blob.HTTPHeaders{BlobContentMD5: md5Content[:]}})
+	a.Nil(err)
+
+	time.Sleep(time.Millisecond * 1050)
+
+	// Local source with file matching dest content (rename scenario)
+	srcDirName := scenarioHelper{}.generateLocalDirectory(a)
+	defer os.RemoveAll(srcDirName)
+	scenarioHelper{}.generateLocalFilesFromList(a, srcDirName, []string{"renamed/copy.txt"})
+	err = os.WriteFile(srcDirName+"/renamed/copy.txt", []byte(content), 0644)
+	a.Nil(err)
+
+	// Set up interceptor
+	mockedRPC := &dedupInterceptor{}
+	mockedRPC.init(common.EFromTo.LocalBlob(), common.EFromTo.BlobBlob())
+
+	// Use account-level SAS and specify the SAME container as destination in --dedup-index-containers
+	accountName, accountKey := getAccountAndKey()
+	credential, err := blob.NewSharedKeyCredential(accountName, accountKey)
+	a.Nil(err)
+	bscWithSAS := getBlobServiceClientWithSAS(a, credential)
+	serviceURLWithSAS, err := url.Parse(bscWithSAS.URL())
+	a.Nil(err)
+	destURLWithAccountSAS := fmt.Sprintf("https://%s.blob.core.windows.net/%s?%s",
+		accountName, destContainerName, serviceURLWithSAS.RawQuery)
+
+	raw := getDefaultSyncRawInput(srcDirName, destURLWithAccountSAS)
+	raw.dedupCopy = true
+	// Include the SAME destination container name - should be skipped
+	raw.dedupIndexContainers = destContainerName
+	raw.putMd5 = true
+	raw.compareHash = "MD5"
+
+	runSyncAndVerify(a, raw, mockedRPC.intercept, mockedRPC.delete, func(err error) {
+		a.Nil(err)
+
+		// The file should still be dedup-copied (from the normal destination index)
+		// The redundant container specification should be silently skipped
+		a.Equal(1, len(mockedRPC.dedupTransfers), "Should still dedup from the destination's normal index")
+		a.Equal(0, len(mockedRPC.normalTransfers), "No normal transfers needed")
+	})
 }

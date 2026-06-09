@@ -100,9 +100,10 @@ type rawSyncCmdArgs struct {
 	deleteDestinationFileIfNecessary bool
 	// Opt-in flag to persist additional properties to Azure Files
 	preserveInfo bool
-	hardlinks    string
-	hashMetaDir  string
-	dedupCopy    bool
+	hardlinks            string
+	hashMetaDir          string
+	dedupCopy            bool
+	dedupIndexContainers string
 }
 
 func (raw rawSyncCmdArgs) toOptions() (opts azcopy.SyncOptions, err error) {
@@ -124,7 +125,8 @@ func (raw rawSyncCmdArgs) toOptions() (opts azcopy.SyncOptions, err error) {
 		IncludeRoot:             raw.includeRoot,
 		HashMetaDir:             raw.hashMetaDir,
 		PreservePermissions:     raw.preservePermissions,
-		DedupCopy:               raw.dedupCopy,
+		DedupCopy:               raw.dedupCopy || raw.dedupIndexContainers != "",
+		DedupIndexContainers:    parseDedupIndexContainers(raw.dedupIndexContainers),
 	}
 	opts.FromTo, err = azcopy.InferAndValidateFromTo(raw.src, raw.dst, raw.fromTo)
 	if err != nil {
@@ -560,4 +562,11 @@ func init() {
 			"\n like file renames, moves, or duplicates. Requires Content-MD5 on destination blobs "+
 			"\n (upload with --put-md5). Auto-enables --compare-hash=MD5 if not set. "+
 			"\n Only effective when the destination is a remote resource.")
+
+	syncCmd.PersistentFlags().StringVar(&raw.dedupIndexContainers, "dedup-index-containers", "",
+		"Comma-separated list of additional containers in the destination account to index for dedup matches. "+
+			"\n When specified, blobs from these containers can also serve as server-side copy sources for dedup, "+
+			"\n enabling cross-container deduplication within the same storage account. "+
+			"\n Implies --dedup-copy. Requires the destination to be Azure Blob Storage. "+
+			"\n Example: --dedup-index-containers=archive,backups")
 }

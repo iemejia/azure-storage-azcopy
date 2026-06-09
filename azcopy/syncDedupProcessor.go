@@ -45,6 +45,14 @@ type syncDedupProcessor struct {
 	// dedupFromTo is the FromTo type for intra-destination copies (e.g., BlobBlob).
 	dedupFromTo common.FromTo
 
+	// crossContainer indicates whether the dedup job uses service-level source/dest roots
+	// (enabling copies from blobs in different containers on the same account).
+	crossContainer bool
+
+	// dstContainerName is the name of the sync destination container. Only used in
+	// cross-container mode to construct full paths that include the container segment.
+	dstContainerName string
+
 	// Counters for reporting
 	dedupCount  int64
 	normalCount int64
@@ -57,12 +65,16 @@ func newSyncDedupProcessor(
 	dedupScheduler *CopyTransferProcessor,
 	normalScheduler *CopyTransferProcessor,
 	dedupFromTo common.FromTo,
+	crossContainer bool,
+	dstContainerName string,
 ) *syncDedupProcessor {
 	return &syncDedupProcessor{
-		hashIndex:       hashIndex,
-		dedupScheduler:  dedupScheduler,
-		normalScheduler: normalScheduler,
-		dedupFromTo:     dedupFromTo,
+		hashIndex:        hashIndex,
+		dedupScheduler:   dedupScheduler,
+		normalScheduler:  normalScheduler,
+		dedupFromTo:      dedupFromTo,
+		crossContainer:   crossContainer,
+		dstContainerName: dstContainerName,
 	}
 }
 
@@ -105,6 +117,19 @@ func (p *syncDedupProcessor) scheduleDedupCopy(obj, matchingDest traverser.Store
 		dstRelativePath = "/" + dstRelativePath
 	}
 
+	// In cross-container mode, the SourceRoot and DestinationRoot are at the service level
+	// (e.g., https://account.blob.core.windows.net). We need to prepend the container name
+	// to both source and destination paths so the STE can correctly parse them.
+	if p.crossContainer {
+		srcContainer := matchingDest.ContainerName
+		if srcContainer != "" {
+			srcRelativePath = "/" + srcContainer + srcRelativePath
+		}
+		if p.dstContainerName != "" {
+			dstRelativePath = "/" + p.dstContainerName + dstRelativePath
+		}
+	}
+
 	// Create a StoredObject that represents the transfer with proper metadata from the source.
 	// We use the original source object's metadata (content-type, etc.) so the destination
 	// gets the correct properties, but size and MD5 from the matching destination blob.
@@ -144,8 +169,12 @@ func (p *syncDedupProcessor) scheduleDedupCopy(obj, matchingDest traverser.Store
 
 	// Log the dedup action
 	if common.AzcopyScanningLogger != nil {
+		srcDesc := matchingDest.RelativePath
+		if p.crossContainer && matchingDest.ContainerName != "" {
+			srcDesc = matchingDest.ContainerName + "/" + matchingDest.RelativePath
+		}
 		common.AzcopyScanningLogger.Log(common.LogInfo,
-			"File "+obj.RelativePath+" will be server-side copied from existing destination path "+matchingDest.RelativePath+" (content dedup)")
+			"File "+obj.RelativePath+" will be server-side copied from existing destination path "+srcDesc+" (content dedup)")
 	}
 
 	return p.dedupScheduler.scheduleTransfer(copyTransfer.Source, copyTransfer.Destination, dedupObj)

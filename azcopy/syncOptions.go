@@ -56,7 +56,8 @@ type cookedSyncOptions struct {
 	preservePermissions     common.PreservePermissionsOption
 	symlinks                common.SymlinkHandlingType
 	hardlinks               common.HardlinkHandlingType
-	dedupCopy               bool // content-based dedup: server-side copy within destination when identical content exists
+	dedupCopy               bool     // content-based dedup: server-side copy within destination when identical content exists
+	dedupIndexContainers    []string // additional containers on the destination account to index for cross-container dedup
 
 	// AzCopy internal use only
 	dryrun                           bool
@@ -184,6 +185,7 @@ func (s *cookedSyncOptions) applyDefaultsAndInferOptions(opts SyncOptions) (err 
 	s.symlinks = opts.Symlinks
 	s.hardlinks = opts.Hardlinks
 	s.dedupCopy = opts.DedupCopy
+	s.dedupIndexContainers = opts.DedupIndexContainers
 	s.dryrun = opts.dryrun
 	s.deleteDestinationFileIfNecessary = opts.deleteDestinationFileIfNecessary
 	s.commandString = opts.commandString
@@ -199,6 +201,10 @@ func (s *cookedSyncOptions) applyDefaultsAndInferOptions(opts SyncOptions) (err 
 	}
 
 	// dedup-copy inference: auto-enable hash comparison (MD5) if not already set
+	if len(s.dedupIndexContainers) > 0 && !s.dedupCopy {
+		s.dedupCopy = true
+		common.GetLifecycleMgr().Info("--dedup-index-containers implies --dedup-copy; auto-enabling dedup")
+	}
 	if s.dedupCopy {
 		if !s.fromTo.To().IsRemote() {
 			common.GetLifecycleMgr().Info("WARNING: --dedup-copy is only effective when the destination is a remote resource. Ignoring for local destinations.")
@@ -321,6 +327,13 @@ func (s *cookedSyncOptions) validateOptions() (err error) {
 
 	if s.cpkOptions.CpkScopeInfo != "" && s.cpkOptions.CpkInfo {
 		return errors.New("cannot use both cpk-by-name and cpk-by-value at the same time")
+	}
+
+	// Validate cross-container dedup options
+	if len(s.dedupIndexContainers) > 0 {
+		if s.fromTo.To() != common.ELocation.Blob() && s.fromTo.To() != common.ELocation.BlobFS() {
+			return fmt.Errorf("--dedup-index-containers requires the destination to be Azure Blob or BlobFS storage")
+		}
 	}
 
 	// Info and Warnings based on the cooked options.
